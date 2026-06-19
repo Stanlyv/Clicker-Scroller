@@ -44,11 +44,14 @@ extension Double {
         return sign + formatted + suffix
     }
 
-    /// Slightly richer form for "per second" readouts (keeps 1 decimal under 10).
+    /// Slightly richer form for "per second" readouts (keeps decimals under 10
+    /// so the gentle early game — 0.05/s, 0.5/s — stays legible).
     func abbreviatedRate() -> String {
         if self == 0 { return "0" }
-        if Swift.abs(self) < 10 && self == self.rounded() { return String(format: "%.0f", self) }
-        if Swift.abs(self) < 10 { return String(format: "%.1f", self) }
+        let v = Swift.abs(self)
+        if v < 1 { return String(format: "%.2f", self) }
+        if v < 10 && self == self.rounded() { return String(format: "%.0f", self) }
+        if v < 10 { return String(format: "%.1f", self) }
         return abbreviated()
     }
 }

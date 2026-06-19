@@ -3,7 +3,8 @@
 //  Clicker Scroller Watch App
 //
 //  The single source of truth for the game: currency, owned upgrades,
-//  idle production, persistence, offline earnings and prestige.
+//  idle production, persistence, prestige and the temporary "frenzy" boost
+//  from catching a Lucky Gear. Points accrue only while the app is open.
 //
 
 import SwiftUI
@@ -20,13 +21,14 @@ final class GameState: ObservableObject {
     // MARK: Ownership (indices align with Catalog arrays)
     @Published private(set) var generatorCounts: [Int]
     @Published private(set) var boostCounts: [Int]
+    @Published private(set) var overdriveOwned: [Bool]
 
     // MARK: Prestige
     @Published private(set) var goldenGears: Int = 0
 
-    /// Transient: points granted while the app was suspended. Drives the
-    /// "welcome back" banner; cleared once shown.
-    @Published var offlineEarnings: Double = 0
+    // MARK: Frenzy (temporary all-production multiplier from a Lucky Gear)
+    @Published private(set) var frenzyEndsAt: Date? = nil
+    @Published private(set) var frenzyFactor: Double = 1
 
     // MARK: Derived production --------------------------------------------------
 
@@ -35,23 +37,48 @@ final class GameState: ObservableObject {
         1.0 + Double(goldenGears) * Catalog.prestigeBonusPerGear
     }
 
-    /// Points earned every time a tooth passes the pawl.
-    var pointsPerTooth: Double {
-        var base = 1.0
+    /// Product of every owned one-time Overdrive.
+    var overdriveMultiplier: Double {
+        var m = 1.0
+        for od in Catalog.overdrives where overdriveOwned[od.id] { m *= od.factor }
+        return m
+    }
+
+    var frenzyActive: Bool { (frenzyEndsAt ?? .distantPast) > Date() }
+    var frenzyRemaining: TimeInterval { max(0, (frenzyEndsAt ?? .distantPast).timeIntervalSinceNow) }
+    var activeMultiplier: Double { frenzyActive ? frenzyFactor : 1 }
+
+    /// Permanent multipliers (prestige × overdrives) — used for shop read-outs.
+    var steadyMultiplier: Double { prestigeMultiplier * overdriveMultiplier }
+    /// Everything that scales production right now, including a live frenzy.
+    var globalMultiplier: Double { steadyMultiplier * activeMultiplier }
+
+    /// Sum of the starting per-tooth value plus each owned boost's flat bonus
+    /// (before multipliers). Spinning starts gentle at 0.1 per tooth.
+    private var clickBase: Double {
+        var base = 0.1
         for boost in Catalog.clickBoosts {
             base += Double(boostCounts[boost.id]) * boost.perToothBonus
         }
-        return base * prestigeMultiplier
+        return base
     }
 
-    /// Idle income from all automatons, points per second.
-    var pointsPerSecond: Double {
+    /// Sum of every generator's milestone-boosted output (before multipliers).
+    private var idleBase: Double {
         var total = 0.0
         for gen in Catalog.generators {
-            total += Double(generatorCounts[gen.id]) * gen.baseOutput
+            let c = generatorCounts[gen.id]
+            total += Double(c) * gen.baseOutput * Catalog.milestoneMultiplier(owned: c)
         }
-        return total * prestigeMultiplier
+        return total
     }
+
+    /// Base points for one tooth — before the live combo multiplier, which the
+    /// gameplay layer applies on top (it only rewards *active* spinning).
+    var pointsPerTooth: Double { clickBase * globalMultiplier }
+
+    /// Idle income from all automatons, points per second.
+    var pointsPerSecond: Double { idleBase * globalMultiplier }
 
     /// Golden gears the player would receive by prestiging right now.
     var pendingGoldenGears: Int {
@@ -70,18 +97,25 @@ final class GameState: ObservableObject {
     init() {
         generatorCounts = Array(repeating: 0, count: Catalog.generators.count)
         boostCounts = Array(repeating: 0, count: Catalog.clickBoosts.count)
+        overdriveOwned = Array(repeating: false, count: Catalog.overdrives.count)
         load()
         startIdleLoop()
     }
 
     // MARK: Gameplay actions ----------------------------------------------------
 
-    /// Called once for every gear tooth that sweeps past the pawl.
-    func registerTooth() {
-        let gain = pointsPerTooth
-        points += gain
-        totalEarned += gain
-        totalTeeth += 1
+    /// Add freshly-earned points (from spinning). The gameplay layer has already
+    /// folded in the combo / crit multipliers.
+    func award(_ amount: Double, teeth: Int) {
+        guard amount > 0 else { return }
+        points += amount
+        totalEarned += amount
+        totalTeeth += teeth
+    }
+
+    func startFrenzy(multiplier: Double, duration: TimeInterval) {
+        frenzyFactor = multiplier
+        frenzyEndsAt = Date().addingTimeInterval(duration)
     }
 
     func canAfford(_ amount: Double) -> Bool { points >= amount }
@@ -94,24 +128,77 @@ final class GameState: ObservableObject {
         boost.cost(owned: boostCounts[boost.id])
     }
 
+    /// Current points/second contributed by everything the player owns of `gen`
+    /// (includes its milestone doublings and permanent multipliers).
+    func outputForGenerator(_ gen: Generator) -> Double {
+        let c = generatorCounts[gen.id]
+        return Double(c) * gen.baseOutput * Catalog.milestoneMultiplier(owned: c) * steadyMultiplier
+    }
+
+    /// This generator's current milestone multiplier (×1, ×2, ×4 …).
+    func milestoneFor(_ gen: Generator) -> Double {
+        Catalog.milestoneMultiplier(owned: generatorCounts[gen.id])
+    }
+
+    func bonusForBoost(_ boost: ClickBoost) -> Double {
+        Double(boostCounts[boost.id]) * boost.perToothBonus * steadyMultiplier
+    }
+
+    func isOverdriveOwned(_ od: Overdrive) -> Bool { overdriveOwned[od.id] }
+
     @discardableResult
-    func buyGenerator(_ gen: Generator) -> Bool {
-        let cost = costForGenerator(gen)
-        guard points >= cost else { return false }
-        points -= cost
-        generatorCounts[gen.id] += 1
+    func buyOverdrive(_ od: Overdrive) -> Bool {
+        guard !overdriveOwned[od.id], points >= od.cost else { return false }
+        points -= od.cost
+        overdriveOwned[od.id] = true
         save()
         return true
     }
 
+    // — Bulk pricing (geometric series) —
+
+    func bulkCostGenerator(_ gen: Generator, count: Int) -> Double {
+        geometricCost(base: gen.baseCost, growth: 1.15, owned: generatorCounts[gen.id], count: count)
+    }
+
+    func bulkCostBoost(_ boost: ClickBoost, count: Int) -> Double {
+        geometricCost(base: boost.baseCost, growth: boost.growth, owned: boostCounts[boost.id], count: count)
+    }
+
+    func maxAffordableGenerator(_ gen: Generator) -> Int {
+        maxAffordable(base: gen.baseCost, growth: 1.15, owned: generatorCounts[gen.id])
+    }
+
+    func maxAffordableBoost(_ boost: ClickBoost) -> Int {
+        maxAffordable(base: boost.baseCost, growth: boost.growth, owned: boostCounts[boost.id])
+    }
+
     @discardableResult
-    func buyBoost(_ boost: ClickBoost) -> Bool {
-        let cost = costForBoost(boost)
-        guard points >= cost else { return false }
-        points -= cost
-        boostCounts[boost.id] += 1
-        save()
-        return true
+    func buyGenerator(_ gen: Generator, count: Int = 1) -> Int {
+        var bought = 0
+        for _ in 0..<max(0, count) {
+            let cost = costForGenerator(gen)
+            guard points >= cost else { break }
+            points -= cost
+            generatorCounts[gen.id] += 1
+            bought += 1
+        }
+        if bought > 0 { save() }
+        return bought
+    }
+
+    @discardableResult
+    func buyBoost(_ boost: ClickBoost, count: Int = 1) -> Int {
+        var bought = 0
+        for _ in 0..<max(0, count) {
+            let cost = costForBoost(boost)
+            guard points >= cost else { break }
+            points -= cost
+            boostCounts[boost.id] += 1
+            bought += 1
+        }
+        if bought > 0 { save() }
+        return bought
     }
 
     func prestige() {
@@ -120,8 +207,56 @@ final class GameState: ObservableObject {
         points = 0
         generatorCounts = Array(repeating: 0, count: Catalog.generators.count)
         boostCounts = Array(repeating: 0, count: Catalog.clickBoosts.count)
+        overdriveOwned = Array(repeating: false, count: Catalog.overdrives.count)
+        frenzyEndsAt = nil
         // totalEarned is kept so the prestige curve keeps climbing.
         save()
+    }
+
+    /// Reset the current run but KEEP earned Golden Gears and the lifetime
+    /// total — a prestige that simply doesn't award any new gears yet.
+    func resetKeepingPrestige() {
+        points = 0
+        generatorCounts = Array(repeating: 0, count: Catalog.generators.count)
+        boostCounts = Array(repeating: 0, count: Catalog.clickBoosts.count)
+        overdriveOwned = Array(repeating: false, count: Catalog.overdrives.count)
+        frenzyEndsAt = nil
+        save()
+    }
+
+    /// Lifetime points required before the next Golden Gear is awarded.
+    var nextGearAt: Double {
+        Double((goldenGears + 1) * (goldenGears + 1)) * Catalog.prestigeDivisor
+    }
+
+    /// Full wipe — everything (including golden gears and lifetime totals) goes
+    /// back to the very first spin.
+    func resetAll() {
+        points = 0
+        totalEarned = 0
+        totalTeeth = 0
+        generatorCounts = Array(repeating: 0, count: Catalog.generators.count)
+        boostCounts = Array(repeating: 0, count: Catalog.clickBoosts.count)
+        overdriveOwned = Array(repeating: false, count: Catalog.overdrives.count)
+        goldenGears = 0
+        frenzyEndsAt = nil
+        save()
+    }
+
+    // MARK: Pricing helpers -----------------------------------------------------
+
+    private func geometricCost(base: Double, growth g: Double, owned: Int, count: Int) -> Double {
+        guard count > 0 else { return 0 }
+        let a = base * pow(g, Double(owned))
+        return (a * (pow(g, Double(count)) - 1) / (g - 1)).rounded()
+    }
+
+    private func maxAffordable(base: Double, growth g: Double, owned: Int) -> Int {
+        let a = base * pow(g, Double(owned))
+        let rhs = 1 + points * (g - 1) / a
+        guard rhs > 1 else { return 0 }
+        // Capped so a huge balance can't trigger a thousands-long buy loop.
+        return max(0, min(1000, Int(floor(log(rhs) / log(g)))))
     }
 
     // MARK: Idle production -----------------------------------------------------
@@ -139,8 +274,11 @@ final class GameState: ObservableObject {
             points += gain
             totalEarned += gain
         }
+        if let end = frenzyEndsAt, end <= Date() {
+            frenzyEndsAt = nil           // expire the frenzy (publishes for the UI)
+        }
         saveAccumulator += dt
-        if saveAccumulator >= 5 {       // periodic autosave
+        if saveAccumulator >= 5 {        // periodic autosave
             saveAccumulator = 0
             save()
         }
@@ -154,6 +292,7 @@ final class GameState: ObservableObject {
         var totalTeeth: Int
         var generatorCounts: [Int]
         var boostCounts: [Int]
+        var overdriveOwned: [Bool]?
         var goldenGears: Int
         var savedAt: TimeInterval
     }
@@ -165,6 +304,7 @@ final class GameState: ObservableObject {
             totalTeeth: totalTeeth,
             generatorCounts: generatorCounts,
             boostCounts: boostCounts,
+            overdriveOwned: overdriveOwned,
             goldenGears: goldenGears,
             savedAt: Date().timeIntervalSince1970
         )
@@ -190,19 +330,11 @@ final class GameState: ObservableObject {
         for i in 0..<min(boostCounts.count, snap.boostCounts.count) {
             boostCounts[i] = snap.boostCounts[i]
         }
-
-        creditOfflineEarnings(since: snap.savedAt)
-    }
-
-    /// Credit a capped amount of idle income earned while suspended.
-    private func creditOfflineEarnings(since savedAt: TimeInterval) {
-        let elapsed = Date().timeIntervalSince1970 - savedAt
-        guard elapsed > 5 else { return }
-        let capped = min(elapsed, 8 * 3600)          // cap at 8 hours
-        let gain = pointsPerSecond * capped * 0.5    // offline runs at half rate
-        guard gain > 1 else { return }
-        points += gain
-        totalEarned += gain
-        offlineEarnings = gain
+        if let saved = snap.overdriveOwned {
+            for i in 0..<min(overdriveOwned.count, saved.count) {
+                overdriveOwned[i] = saved[i]
+            }
+        }
+        // No offline earnings: points only accrue while the app is open.
     }
 }

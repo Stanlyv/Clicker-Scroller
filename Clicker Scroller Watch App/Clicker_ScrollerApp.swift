@@ -18,8 +18,8 @@ struct Clicker_Scroller_Watch_AppApp: App {
                 .environmentObject(game)
         }
         .onChange(of: scenePhase) { _, phase in
-            // Persist whenever we leave the foreground so offline earnings and
-            // progress survive being backgrounded.
+            // Persist whenever we leave the foreground so progress survives
+            // being backgrounded.
             if phase != .active { game.save() }
         }
     }

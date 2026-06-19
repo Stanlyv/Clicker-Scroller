@@ -15,6 +15,8 @@ struct GearView: View {
     var tickCount: Int
     /// Use the prestige (gold) look once the player has ascended.
     var golden: Bool = false
+    /// 0…1 "heat" from the live combo — makes the halo bigger, brighter, hotter.
+    var intensity: Double = 0
 
     private let teeth = 12
 
@@ -22,9 +24,15 @@ struct GearView: View {
     @State private var sparkOpacity: Double = 0
     @State private var sparkScale: CGFloat = 0.5
     @State private var pulse: CGFloat = 1
+    @State private var tickScale: CGFloat = 1
 
     private var metal: AngularGradient { golden ? Theme.goldMetal : Theme.brassMetal }
-    private var glowColor: Color { golden ? Theme.gold : Theme.amberGlow }
+
+    /// Amber when calm, shifting to hot orange/red as the combo builds.
+    private var glowColor: Color {
+        let t = min(1, max(0, intensity))
+        return Color(red: 1.0, green: 0.66 - 0.34 * t, blue: 0.22 - 0.14 * t)
+    }
 
     var body: some View {
         GeometryReader { geo in
@@ -33,18 +41,20 @@ struct GearView: View {
             let r = size / 2
 
             ZStack {
-                // — Soft ambient glow behind the gear —
+                // — Soft ambient glow behind the gear (grows hotter with combo) —
                 Circle()
                     .fill(
-                        RadialGradient(colors: [glowColor.opacity(0.55), .clear],
+                        RadialGradient(colors: [glowColor.opacity(0.5 + 0.45 * intensity), .clear],
                                        center: .center, startRadius: r * 0.2, endRadius: r * 1.15)
                     )
-                    .frame(width: size * 1.5, height: size * 1.5)
+                    .frame(width: size * (1.45 + 0.4 * intensity),
+                           height: size * (1.45 + 0.4 * intensity))
                     .scaleEffect(pulse)
                     .blur(radius: 6)
 
-                // — The rotating gear body —
+                // — The rotating gear body (bounces a touch on each catch) —
                 gearBody(size: size)
+                    .scaleEffect(tickScale)
                     .rotationEffect(.degrees(angle))
                     .shadow(color: .black.opacity(0.5), radius: 5, y: 3)
 
@@ -163,6 +173,11 @@ struct GearView: View {
         pawlFlick = 13
         withAnimation(.spring(response: 0.17, dampingFraction: 0.42)) {
             pawlFlick = 0
+        }
+        // Gear gives a tiny squash-and-stretch kick.
+        tickScale = 1.05
+        withAnimation(.spring(response: 0.2, dampingFraction: 0.5)) {
+            tickScale = 1
         }
         // Spark pop.
         sparkOpacity = 1

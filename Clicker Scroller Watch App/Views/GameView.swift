@@ -2,123 +2,136 @@
 //  GameView.swift
 //  Clicker Scroller Watch App
 //
-//  The play screen. Two ways to spin the cog, both feeding the same scoring
-//  pipeline (`applyRotation`):
-//    • Digital Crown — bound at the root (NOT to a scroll view), so the screen
-//      itself never scrolls.
-//    • Drag-to-spin — flick the gear directly like a physical wheel. Handy on a
-//      real wrist and essential in the Simulator, where the crown is awkward.
-//
-//  Focus note: the whole screen is the single focusable surface and the crown
-//  is bound at the root. There are deliberately no other focusable controls
-//  here (the Workshop opens as a sheet from a tap gesture, not a Button),
-//  because a competing focusable element will silently steal the crown.
+//  The play screen. Spin the cog with the Digital Crown OR by flicking it.
+//  Fast spinning fills the COMBO ring; random teeth CRIT; a rare Lucky Gear
+//  grants a FRENZY. The whole screen earns its keep:
+//    • top    — score + live stat chips
+//    • middle — gear wrapped in a combo-energy ring
+//    • bottom — a progress bar to your next upgrade, tap to open the Workshop
 //
 
 import SwiftUI
-import WatchKit
+import Combine
 
 struct GameView: View {
     @EnvironmentObject private var game: GameState
     @Environment(\.scenePhase) private var scenePhase
 
-    // — Crown → gear plumbing —
+    // — Crown → gear —
     @State private var crownValue: Double = 0
     @State private var lastCrown: Double = 0
-    @State private var gearAngle: Double = 0          // accumulated degrees (signed)
-    @State private var tickCount: Int = 0             // feeds the pawl flick / spark
+    @State private var gearAngle: Double = 0
+    @State private var tickCount: Int = 0
     @FocusState private var crownFocused: Bool
 
-    // — Drag-to-spin —
+    // — Drag + flywheel momentum —
     @State private var lastDragAngle: Double? = nil
+    @State private var lastDragTime: Date = .now
+    @State private var dragVelocity: Double = 0
+    @State private var spinVelocity: Double = 0
+    @State private var isDragging = false
+
+    // — Combo —
+    @State private var comboEnergy: Double = 0
+
+    // — Lucky Gear / frenzy —
+    @State private var luckyVisible = false
+    @State private var luckyNorm = CGPoint(x: 0.5, y: 0.5)
+    @State private var luckyDespawnAt: Date = .distantFuture
+    @State private var nextLuckyAt: Date = .distantFuture
+    @State private var flashOpacity: Double = 0
 
     // — Juice / nav —
     @State private var floaters: [Floater] = []
-    @State private var showOfflineBanner = false
     @State private var showShop = false
+    @State private var firstHint = true
+    @State private var lastFloaterAt: Date = .distantPast
 
-    // Tuning. 12 teeth → 30° per tooth. `degPerCrownUnit` is the one knob that
-    // sets how fast the gear spins relative to the crown — raise it to spin
-    // faster (more points per flick), lower it for a slower grind. Paired with
-    // `.medium` crown sensitivity below, this tracks the native list-scroll feel.
+    @State private var frameTimer = Timer.publish(every: 1.0 / 30.0, on: .main, in: .common).autoconnect()
+
+    // — Tuning —
     private let teeth = 12
     private var degPerTooth: Double { 360.0 / Double(teeth) }
     private let degPerCrownUnit: Double = 12.0
+    private let stepDt = 1.0 / 30.0
+    private let maxCombo = 3.0
+    private let comboGainPerTooth = 0.035
+    private let comboDecayPerStep = 0.02
+    private let momentumFriction = 0.90
+    private let minSpinVel = 26.0
+    private let velCap = 1400.0
+    private let critChance = 0.05
+    private let critMultiplier = 5.0
+
+    private var comboMultiplier: Double { 1 + comboEnergy * (maxCombo - 1) }
+    private var heat: Double { max(comboEnergy, game.frenzyActive ? 0.85 : 0) }
+    private func hotColor(_ t: Double) -> Color {
+        Color(red: 1.0, green: 0.70 - 0.40 * t, blue: 0.28 - 0.16 * t)
+    }
 
     var body: some View {
         ZStack {
             Theme.background
 
             GeometryReader { geo in
-                // One explicit gear size, computed from the height left after the
-                // header and the pill. Spacers only centre it — they don't size it.
-                let gearSide = max(74, min(min(geo.size.width - 14, geo.size.height - 102), 132))
-                VStack(spacing: 0) {
-                    scoreHeader
+                let gearOuter = max(86, min(min(geo.size.width - 6, geo.size.height - 92), 150))
+                ZStack {
+                    VStack(spacing: 0) {
+                        scoreHeader
+                        Spacer(minLength: 2)
+                        gearArea.frame(width: gearOuter, height: gearOuter)
+                        Spacer(minLength: 2)
+                        upgradesButton
+                    }
+                    .frame(width: geo.size.width, height: geo.size.height)
 
-                    Spacer(minLength: 8)
-
-                    gearArea
-                        .frame(width: gearSide, height: gearSide)
-
-                    Spacer(minLength: 8)
-
-                    workshopPill
+                    if luckyVisible {
+                        luckyGear
+                            .position(x: luckyNorm.x * geo.size.width,
+                                      y: luckyNorm.y * geo.size.height)
+                            .transition(.scale.combined(with: .opacity))
+                    }
                 }
                 .frame(width: geo.size.width, height: geo.size.height)
             }
-            .padding(.horizontal, 8)
-            .padding(.vertical, 4)
+            .padding(.horizontal, 6)
+            .padding(.vertical, 3)
 
-            if showOfflineBanner {
-                offlineBanner
-                    .transition(.move(edge: .top).combined(with: .opacity))
+            if flashOpacity > 0 {
+                Color.white.opacity(flashOpacity).ignoresSafeArea().allowsHitTesting(false)
             }
         }
-        // One focusable surface for the whole screen; the crown drives the gear.
         .focusable(true)
         .focused($crownFocused)
         .digitalCrownRotation(
             $crownValue,
-            from: -1_000_000,
-            through: 1_000_000,
-            by: 0.05,
-            sensitivity: .medium,
-            isContinuous: false,
-            isHapticFeedbackEnabled: false      // we play our own click per tooth
+            from: -1_000_000, through: 1_000_000, by: 0.05,
+            sensitivity: .medium, isContinuous: false, isHapticFeedbackEnabled: false
         )
         .onChange(of: crownValue) { _, newValue in
-            handleCrown(newValue)
+            let delta = newValue - lastCrown
+            lastCrown = newValue
+            spinVelocity = 0
+            applyRotation(delta * degPerCrownUnit)
         }
+        .onReceive(frameTimer) { _ in step() }
         .onAppear {
             acquireCrownFocus()
-            if game.offlineEarnings > 1 {
-                showOfflineBanner = true
-                DispatchQueue.main.asyncAfter(deadline: .now() + 3.5) {
-                    withAnimation(.easeInOut) { showOfflineBanner = false }
-                    game.offlineEarnings = 0
-                }
-            }
+            scheduleFirstLucky()
         }
         .onChange(of: scenePhase) { _, phase in
             if phase == .active { acquireCrownFocus() }
         }
         .onChange(of: showShop) { _, isShowing in
-            if !isShowing { acquireCrownFocus() }   // reclaim crown after the shop
+            if !isShowing { acquireCrownFocus() }
         }
-        .sheet(isPresented: $showShop) {
-            NavigationStack { ShopView() }
-        }
-        // Put our own content on the system clock's row (top-left), next to the
-        // time — the time itself can't be hidden on watchOS.
+        .sheet(isPresented: $showShop) { NavigationStack { ShopView() } }
         .toolbar {
             ToolbarItem(placement: .topBarLeading) {
                 if game.goldenGears > 0 {
                     HStack(spacing: 3) {
-                        Image(systemName: "gearshape.fill")
-                            .font(.system(size: 11, weight: .bold))
-                        Text("\(game.goldenGears)")
-                            .font(.system(size: 14, weight: .bold, design: .rounded))
+                        Image(systemName: "gearshape.fill").font(.system(size: 11, weight: .bold))
+                        Text("\(game.goldenGears)").font(.system(size: 14, weight: .bold, design: .rounded))
                     }
                     .foregroundStyle(Theme.gold)
                 }
@@ -126,160 +139,259 @@ struct GameView: View {
         }
     }
 
-    // MARK: Gear ----------------------------------------------------------------
+    // MARK: Header --------------------------------------------------------------
+
+    private var scoreHeader: some View {
+        VStack(spacing: 3) {
+            Text(game.points.abbreviated())
+                .font(.system(size: 33, weight: .heavy, design: .rounded))
+                .foregroundStyle(LinearGradient(colors: [Theme.brassLight, Theme.brass],
+                                                startPoint: .top, endPoint: .bottom))
+                .shadow(color: Theme.amberGlow.opacity(0.5), radius: 4)
+                .minimumScaleFactor(0.5).lineLimit(1)
+
+            HStack(spacing: 5) {
+                statChip("bolt.fill", "\(game.pointsPerSecond.abbreviatedRate())/s", Theme.amber)
+                if game.frenzyActive {
+                    frenzyChip
+                } else {
+                    statChip("hand.tap.fill", "+\(game.pointsPerTooth.abbreviated())", Theme.brass)
+                }
+            }
+        }
+    }
+
+    private func statChip(_ icon: String, _ text: String, _ tint: Color) -> some View {
+        HStack(spacing: 3) {
+            Image(systemName: icon).font(.system(size: 9, weight: .bold))
+            Text(text).font(.system(size: 11, weight: .bold, design: .rounded))
+                .lineLimit(1).minimumScaleFactor(0.7)
+        }
+        .foregroundStyle(tint)
+        .padding(.horizontal, 7).padding(.vertical, 3)
+        .background(Capsule().fill(Theme.bgTop.opacity(0.6)))
+    }
+
+    private var frenzyChip: some View {
+        TimelineView(.periodic(from: .now, by: 0.5)) { _ in
+            HStack(spacing: 3) {
+                Image(systemName: "flame.fill").font(.system(size: 9, weight: .bold))
+                Text("×\(Int(game.frenzyFactor)) · \(Int(ceil(game.frenzyRemaining)))s")
+                    .font(.system(size: 11, weight: .heavy, design: .rounded))
+            }
+            .foregroundStyle(Theme.bgBottom)
+            .padding(.horizontal, 7).padding(.vertical, 3)
+            .background(Capsule().fill(Theme.amber))
+        }
+    }
+
+    // MARK: Gear + combo ring ---------------------------------------------------
 
     private var gearArea: some View {
-        // The parent gives this a fixed square frame, so the gear simply fills it.
         GeometryReader { geo in
-            let side = min(geo.size.width, geo.size.height)
+            let outer = min(geo.size.width, geo.size.height)
+            let gear = outer - 14
             let center = CGPoint(x: geo.size.width / 2, y: geo.size.height / 2)
             ZStack {
+                comboRing(diameter: outer)
                 GearView(angle: gearAngle, tickCount: tickCount,
-                         golden: game.goldenGears > 0)
-                    .frame(width: side, height: side)
+                         golden: game.goldenGears > 0, intensity: heat)
+                    .frame(width: gear, height: gear)
 
                 ForEach(floaters) { f in
                     FloatingScoreLabel(floater: f) { id in
                         floaters.removeAll { $0.id == id }
                     }
-                    .offset(y: -8)
+                    .offset(y: -6)
                 }
             }
             .frame(width: geo.size.width, height: geo.size.height)
+            .overlay(alignment: .top) { comboTag }
+            .overlay(alignment: .bottom) {
+                if firstHint {
+                    Text("spin me ↻")
+                        .font(.system(size: 10, weight: .semibold, design: .rounded))
+                        .foregroundStyle(Theme.inkDim)
+                        .transition(.opacity)
+                }
+            }
             .contentShape(Rectangle())
             .gesture(spinGesture(center: center))
         }
     }
 
+    private func comboRing(diameter: CGFloat) -> some View {
+        ZStack {
+            Circle().stroke(Theme.brassShadow.opacity(0.35), lineWidth: 4)
+            Circle()
+                .trim(from: 0, to: max(0.001, comboEnergy))
+                .stroke(hotColor(comboEnergy),
+                        style: StrokeStyle(lineWidth: 4, lineCap: .round))
+                .rotationEffect(.degrees(-90))
+                .shadow(color: hotColor(comboEnergy).opacity(0.7 * comboEnergy), radius: 4)
+        }
+        .frame(width: diameter, height: diameter)
+    }
+
+    private var comboTag: some View {
+        Text("×\(String(format: "%.1f", comboMultiplier))")
+            .font(.system(size: 12, weight: .heavy, design: .rounded))
+            .foregroundStyle(hotColor(comboEnergy))
+            .padding(.horizontal, 6).padding(.vertical, 1)
+            .background(Capsule().fill(.black.opacity(0.5)))
+            .scaleEffect(1 + comboEnergy * 0.15)
+            .opacity(comboEnergy > 0.12 ? 1 : 0)
+            .offset(y: -3)
+    }
+
     private func spinGesture(center: CGPoint) -> some Gesture {
         DragGesture(minimumDistance: 0)
             .onChanged { value in
+                isDragging = true
+                let now = Date()
                 let dx = value.location.x - center.x
                 let dy = value.location.y - center.y
-                let angle = atan2(dy, dx) * 180 / .pi
+                let ang = atan2(dy, dx) * 180 / .pi
                 if let prev = lastDragAngle {
-                    var d = angle - prev
+                    var d = ang - prev
                     if d > 180 { d -= 360 } else if d < -180 { d += 360 }
                     applyRotation(d)
+                    let dt = now.timeIntervalSince(lastDragTime)
+                    if dt > 0.001 { dragVelocity = 0.6 * dragVelocity + 0.4 * (d / dt) }
                 }
-                lastDragAngle = angle
+                lastDragAngle = ang
+                lastDragTime = now
             }
-            .onEnded { _ in lastDragAngle = nil }
-    }
-
-    // MARK: Rotation → scoring (shared by crown + drag) -------------------------
-
-    /// Focus must be (re)claimed after the hierarchy settles — doing it only
-    /// synchronously is often too early and silently fails, so we set it now
-    /// and again once the run loop has cycled.
-    private func acquireCrownFocus() {
-        crownFocused = true
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
-            crownFocused = true
-        }
-    }
-
-    private func handleCrown(_ newValue: Double) {
-        let delta = newValue - lastCrown
-        lastCrown = newValue
-        applyRotation(delta * degPerCrownUnit)
-    }
-
-    /// The single chokepoint: advance the gear by `deltaDeg` and award a point
-    /// for every tooth that sweeps past the pawl (either direction).
-    private func applyRotation(_ deltaDeg: Double) {
-        guard deltaDeg != 0 else { return }
-
-        let before = floor(gearAngle / degPerTooth)
-        gearAngle += deltaDeg
-        let after = floor(gearAngle / degPerTooth)
-
-        let crossed = Int(after - before)
-        guard crossed != 0 else { return }
-
-        let n = min(abs(crossed), 100)          // safety clamp on huge jumps
-        let perTooth = game.pointsPerTooth
-        for _ in 0..<n { game.registerTooth() }
-        tickCount &+= n
-
-        WKInterfaceDevice.current().play(.click)
-        spawnFloater(amount: perTooth * Double(n))
-    }
-
-    private func spawnFloater(amount: Double) {
-        let f = Floater(text: "+\(amount.abbreviated())",
-                        xJitter: CGFloat.random(in: -14...14))
-        floaters.append(f)
-        if floaters.count > 12 { floaters.removeFirst(floaters.count - 12) }
-    }
-
-    // MARK: Header --------------------------------------------------------------
-
-    private var scoreHeader: some View {
-        VStack(spacing: 1) {
-            Text(game.points.abbreviated())
-                .font(.system(size: 32, weight: .heavy, design: .rounded))
-                .foregroundStyle(
-                    LinearGradient(colors: [Theme.brassLight, Theme.brass],
-                                   startPoint: .top, endPoint: .bottom)
-                )
-                .shadow(color: Theme.amberGlow.opacity(0.5), radius: 4)
-                .minimumScaleFactor(0.5)
-                .lineLimit(1)
-                .contentTransition(.numericText())
-                .animation(.snappy(duration: 0.15), value: game.points)
-
-            HStack(spacing: 8) {
-                Label("\(game.pointsPerSecond.abbreviatedRate())/s",
-                      systemImage: "bolt.fill")
-                Label("\(game.pointsPerTooth.abbreviated())", systemImage: "gearshape.2.fill")
+            .onEnded { _ in
+                isDragging = false
+                lastDragAngle = nil
+                spinVelocity = max(-velCap, min(velCap, dragVelocity))
+                dragVelocity = 0
             }
-            .font(.system(size: 10, weight: .semibold, design: .rounded))
-            .foregroundStyle(Theme.inkDim)
-        }
     }
 
-    // MARK: Workshop affordance (tap, NOT a focusable Button) --------------------
+    // MARK: Upgrades button -----------------------------------------------------
 
-    private var workshopPill: some View {
-        HStack(spacing: 5) {
-            Image(systemName: "wrench.and.screwdriver.fill")
-                .font(.system(size: 11))
-            Text("Workshop")
-                .font(.system(size: 12, weight: .bold, design: .rounded))
+    private var upgradesButton: some View {
+        HStack(spacing: 6) {
+            Image(systemName: "wrench.and.screwdriver.fill").font(.system(size: 12))
+            Text("Upgrades").font(.system(size: 13, weight: .bold, design: .rounded))
         }
         .foregroundStyle(Theme.ink)
         .frame(maxWidth: .infinity)
-        .padding(.vertical, 5)
-        .background(
-            Capsule().fill(
-                LinearGradient(colors: [Theme.brassDeep, Theme.copperDeep],
-                               startPoint: .top, endPoint: .bottom)
-            )
-        )
+        .padding(.vertical, 6)
+        .background(Capsule().fill(LinearGradient(colors: [Theme.brassDeep, Theme.copperDeep],
+                                                  startPoint: .top, endPoint: .bottom)))
         .overlay(Capsule().stroke(Theme.brass.opacity(0.6), lineWidth: 1))
         .contentShape(Capsule())
         .onTapGesture {
-            WKInterfaceDevice.current().play(.click)
             showShop = true
         }
     }
 
-    // MARK: Offline banner ------------------------------------------------------
+    // MARK: Per-frame step ------------------------------------------------------
 
-    private var offlineBanner: some View {
-        VStack {
-            HStack(spacing: 6) {
-                Image(systemName: "moon.zzz.fill")
-                Text("While away: +\(game.offlineEarnings.abbreviated())")
-                    .font(.system(size: 11, weight: .bold, design: .rounded))
-            }
-            .foregroundStyle(Theme.bgBottom)
-            .padding(.horizontal, 12)
-            .padding(.vertical, 6)
-            .background(Capsule().fill(Theme.amber))
-            .padding(.top, 4)
-            Spacer()
+    private func step() {
+        if comboEnergy > 0 {
+            comboEnergy = max(0, comboEnergy - comboDecayPerStep)
         }
+        if !isDragging {
+            if abs(spinVelocity) > minSpinVel {
+                applyRotation(spinVelocity * stepDt)
+                spinVelocity *= momentumFriction
+            } else if spinVelocity != 0 {
+                spinVelocity = 0
+            }
+        }
+        updateLucky()
+    }
+
+    // MARK: Rotation → scoring --------------------------------------------------
+
+    private func applyRotation(_ deltaDeg: Double) {
+        guard deltaDeg != 0 else { return }
+        if firstHint { withAnimation(.easeOut(duration: 0.4)) { firstHint = false } }
+
+        let before = floor(gearAngle / degPerTooth)
+        gearAngle += deltaDeg
+        let after = floor(gearAngle / degPerTooth)
+        let crossed = Int(after - before)
+        guard crossed != 0 else { return }
+
+        let n = min(abs(crossed), 80)
+        comboEnergy = min(1, comboEnergy + comboGainPerTooth * Double(n))
+
+        let crit = Double.random(in: 0..<1) < critChance
+        var gain = game.pointsPerTooth * comboMultiplier * Double(n)
+        if crit { gain *= critMultiplier }
+        game.award(gain, teeth: n)
+        tickCount &+= n
+
+        let now = Date()
+        if crit {
+            spawnFloater(text: "✦ +\(gain.abbreviated())", crit: true)
+            lastFloaterAt = now
+        } else if now.timeIntervalSince(lastFloaterAt) > 0.07 {
+            spawnFloater(text: "+\(gain.abbreviated())", crit: false)
+            lastFloaterAt = now
+        }
+    }
+
+    private func spawnFloater(text: String, crit: Bool) {
+        floaters.append(Floater(text: text, xJitter: CGFloat.random(in: -16...16), isCrit: crit))
+        if floaters.count > 14 { floaters.removeFirst(floaters.count - 14) }
+    }
+
+    private func acquireCrownFocus() {
+        crownFocused = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { crownFocused = true }
+    }
+
+    // MARK: Lucky Gear ----------------------------------------------------------
+
+    private var luckyGear: some View {
+        ZStack {
+            Circle().fill(RadialGradient(colors: [Theme.gold.opacity(0.6), .clear],
+                                         center: .center, startRadius: 2, endRadius: 30))
+                .frame(width: 60, height: 60)
+            Image(systemName: "gearshape.fill")
+                .font(.system(size: 32, weight: .black))
+                .foregroundStyle(Theme.goldMetal)
+                .shadow(color: Theme.gold, radius: 6)
+                .symbolEffect(.pulse, options: .repeating)
+        }
+        .frame(width: 52, height: 52)
+        .contentShape(Circle())
+        .onTapGesture { catchLucky() }
+    }
+
+    private func scheduleFirstLucky() {
+        if nextLuckyAt == .distantFuture {
+            nextLuckyAt = Date().addingTimeInterval(Double.random(in: 35...70))
+        }
+    }
+
+    private func updateLucky() {
+        let now = Date()
+        if luckyVisible {
+            if now >= luckyDespawnAt {
+                withAnimation(.easeOut(duration: 0.3)) { luckyVisible = false }
+                nextLuckyAt = now.addingTimeInterval(Double.random(in: 70...130))
+            }
+        } else if now >= nextLuckyAt {
+            luckyNorm = CGPoint(x: CGFloat.random(in: 0.2...0.8),
+                                y: CGFloat.random(in: 0.34...0.64))
+            luckyDespawnAt = now.addingTimeInterval(6)
+            withAnimation(.spring(response: 0.35, dampingFraction: 0.6)) { luckyVisible = true }
+        }
+    }
+
+    private func catchLucky() {
+        game.startFrenzy(multiplier: 5, duration: 10)
+        withAnimation(.easeOut(duration: 0.25)) { luckyVisible = false }
+        nextLuckyAt = Date().addingTimeInterval(Double.random(in: 90...150))
+        spawnFloater(text: "FRENZY ×5!", crit: true)
+        flashOpacity = 0.45
+        withAnimation(.easeOut(duration: 0.55)) { flashOpacity = 0 }
     }
 }
