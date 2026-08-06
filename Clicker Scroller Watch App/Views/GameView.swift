@@ -48,6 +48,8 @@ struct GameView: View {
     @State private var lastFloaterAt: Date = .distantPast
 
     @State private var frameTimer = Timer.publish(every: 1.0 / 30.0, on: .main, in: .common).autoconnect()
+    /// Off-screen frames do no work — see `step()`.
+    @State private var isActive = true
 
     // — Tuning —
     private let teeth = 12
@@ -120,7 +122,20 @@ struct GameView: View {
             scheduleFirstLucky()
         }
         .onChange(of: scenePhase) { _, phase in
-            if phase == .active { acquireCrownFocus() }
+            isActive = (phase == .active)
+            if isActive {
+                acquireCrownFocus()
+                // Coming back from a long absence shouldn't fire a Lucky Gear
+                // the instant the screen lights up — the player would never
+                // see it before the 6s despawn.
+                if nextLuckyAt <= Date() {
+                    nextLuckyAt = Date().addingTimeInterval(Double.random(in: 20...45))
+                }
+            } else {
+                // Don't let the flywheel coast (and score) behind a dark screen.
+                spinVelocity = 0
+                dragVelocity = 0
+            }
         }
         .onChange(of: showShop) { _, isShowing in
             if !isShowing { acquireCrownFocus() }
@@ -159,6 +174,14 @@ struct GameView: View {
                 }
             }
         }
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("Points")
+        .accessibilityValue(
+            "\(game.points.abbreviated()), earning \(game.pointsPerSecond.abbreviatedRate()) per second"
+            + (game.frenzyActive
+               ? ", frenzy times \(Int(game.frenzyFactor)) for \(Int(ceil(game.frenzyRemaining))) seconds"
+               : ", \(game.pointsPerTooth.abbreviated()) per tooth")
+        )
     }
 
     private func statChip(_ icon: String, _ text: String, _ tint: Color) -> some View {
@@ -217,6 +240,20 @@ struct GameView: View {
             }
             .contentShape(Rectangle())
             .gesture(spinGesture(center: center))
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel("Gear")
+            .accessibilityHint("Swipe up or down to turn the gear one tooth and earn points")
+            .accessibilityValue("Combo multiplier \(String(format: "%.1f", comboMultiplier))")
+            // VoiceOver claims the Digital Crown for navigation, which would
+            // otherwise leave the gear — the whole game — unspinnable. Adjustable
+            // actions give it back as a swipe per tooth.
+            .accessibilityAdjustableAction { direction in
+                switch direction {
+                case .increment: applyRotation(degPerTooth)
+                case .decrement: applyRotation(-degPerTooth)
+                @unknown default: break
+                }
+            }
         }
     }
 
@@ -285,13 +322,22 @@ struct GameView: View {
         .overlay(Capsule().stroke(Theme.brass.opacity(0.6), lineWidth: 1))
         .contentShape(Capsule())
         .onTapGesture {
+            Haptics.purchase()
             showShop = true
         }
+        // Deliberately not a Button: a second focusable view steals the Digital
+        // Crown from the gear. The trait restores what VoiceOver would lose.
+        .accessibilityElement(children: .ignore)
+        .accessibilityAddTraits(.isButton)
+        .accessibilityLabel("Upgrades")
+        .accessibilityHint("Opens the Workshop")
+        .accessibilityAction { Haptics.purchase(); showShop = true }
     }
 
     // MARK: Per-frame step ------------------------------------------------------
 
     private func step() {
+        guard isActive else { return }
         if comboEnergy > 0 {
             comboEnergy = max(0, comboEnergy - comboDecayPerStep)
         }
@@ -316,6 +362,14 @@ struct GameView: View {
         gearAngle += deltaDeg
         let after = floor(gearAngle / degPerTooth)
         let crossed = Int(after - before)
+
+        // Keep the accumulator bounded over a long session. A full turn is a
+        // whole number of teeth (360° / 12), so wrapping is invisible both to
+        // tooth counting above and to the rendered rotation.
+        if gearAngle > 3600 || gearAngle < -3600 {
+            gearAngle -= (gearAngle / 360).rounded(.towardZero) * 360
+        }
+
         guard crossed != 0 else { return }
 
         let n = min(abs(crossed), 80)
@@ -329,11 +383,15 @@ struct GameView: View {
 
         let now = Date()
         if crit {
+            Haptics.crit()
             spawnFloater(text: "✦ +\(gain.abbreviated())", crit: true)
             lastFloaterAt = now
-        } else if now.timeIntervalSince(lastFloaterAt) > 0.07 {
-            spawnFloater(text: "+\(gain.abbreviated())", crit: false)
-            lastFloaterAt = now
+        } else {
+            Haptics.tick()
+            if now.timeIntervalSince(lastFloaterAt) > 0.07 {
+                spawnFloater(text: "+\(gain.abbreviated())", crit: false)
+                lastFloaterAt = now
+            }
         }
     }
 
@@ -363,6 +421,11 @@ struct GameView: View {
         .frame(width: 52, height: 52)
         .contentShape(Circle())
         .onTapGesture { catchLucky() }
+        .accessibilityElement(children: .ignore)
+        .accessibilityAddTraits(.isButton)
+        .accessibilityLabel("Lucky Gear")
+        .accessibilityHint("Tap for a 10 second times 5 frenzy")
+        .accessibilityAction { catchLucky() }
     }
 
     private func scheduleFirstLucky() {
@@ -387,6 +450,7 @@ struct GameView: View {
     }
 
     private func catchLucky() {
+        Haptics.frenzy()
         game.startFrenzy(multiplier: 5, duration: 10)
         withAnimation(.easeOut(duration: 0.25)) { luckyVisible = false }
         nextLuckyAt = Date().addingTimeInterval(Double.random(in: 90...150))

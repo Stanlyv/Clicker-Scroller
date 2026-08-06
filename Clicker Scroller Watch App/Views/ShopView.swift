@@ -17,9 +17,15 @@ struct ShopView: View {
     @EnvironmentObject private var game: GameState
     @State private var qty: BuyQty = .one
     @State private var showPrestige = false
+    @State private var hapticsOn = Haptics.enabled
 
     var body: some View {
-        List {
+        // Resolved once per body pass. It scans the entire catalog, and the
+        // balance republishes ten times a second — evaluating it per row (as
+        // `recommended: recommendedID == …` used to) squared that cost.
+        let recommended = recommendedID
+
+        return List {
             balanceHeader.listRowBackground(Color.clear)
             quantityPicker.listRowBackground(Color.clear)
 
@@ -36,7 +42,7 @@ struct ShopView: View {
                         countLabel: p.countLabel,
                         owned: game.boostCounts[boost.id],
                         affordable: p.affordable,
-                        recommended: recommendedID == "b\(boost.id)"
+                        recommended: recommended == "b\(boost.id)"
                     ) { buy { game.buyBoost(boost, count: p.buyCount) } }
                 }
             } header: { sectionHeader("Click Boosts", systemImage: "hand.tap.fill") }
@@ -52,7 +58,7 @@ struct ShopView: View {
                         countLabel: p.countLabel,
                         owned: game.generatorCounts[gen.id],
                         affordable: p.affordable,
-                        recommended: recommendedID == "g\(gen.id)"
+                        recommended: recommended == "g\(gen.id)"
                     ) { buy { game.buyGenerator(gen, count: p.buyCount) } }
                 }
             } header: { sectionHeader("Automatons", systemImage: "gearshape.2.fill") }
@@ -70,7 +76,7 @@ struct ShopView: View {
                         affordable: !owned && game.canAfford(od.cost),
                         recommended: false
                     ) {
-                        _ = game.buyOverdrive(od)
+                        if game.buyOverdrive(od) { Haptics.purchase() }
                     }
                 }
             } header: { sectionHeader("Overdrives · ×\(Int(game.overdriveMultiplier))", systemImage: "bolt.fill") }
@@ -78,6 +84,10 @@ struct ShopView: View {
             Section {
                 prestigeRow
             } header: { sectionHeader("Prestige", systemImage: "sparkles") }
+
+            Section {
+                hapticsRow
+            } header: { sectionHeader("Settings", systemImage: "slider.horizontal.3") }
         }
         .listStyle(.plain)
         .scrollContentBackground(.hidden)
@@ -88,17 +98,21 @@ struct ShopView: View {
             if game.canPrestige {
                 Button("Prestige · +\(game.pendingGoldenGears) gears", role: .destructive) {
                     game.prestige()
+                    Haptics.prestige()
                 }
             } else if game.goldenGears > 0 {
                 Button("Reset · keep \(game.goldenGears) gears", role: .destructive) {
                     game.resetKeepingPrestige()
+                    Haptics.prestige()
                 }
                 Button("Full reset · lose gears", role: .destructive) {
                     game.resetAll()
+                    Haptics.prestige()
                 }
             } else {
                 Button("Reset everything", role: .destructive) {
                     game.resetAll()
+                    Haptics.prestige()
                 }
             }
             Button("Cancel", role: .cancel) { }
@@ -146,19 +160,21 @@ struct ShopView: View {
     /// Cheapest single item the player can afford right now — flagged with a star.
     private var recommendedID: String? {
         var best: (id: String, cost: Double)? = nil
-        for b in Catalog.clickBoosts where game.points >= game.costForBoost(b) {
+        for b in Catalog.clickBoosts {
             let c = game.costForBoost(b)
+            guard game.points >= c else { continue }
             if best == nil || c < best!.cost { best = ("b\(b.id)", c) }
         }
-        for g in Catalog.generators where game.points >= game.costForGenerator(g) {
+        for g in Catalog.generators {
             let c = game.costForGenerator(g)
+            guard game.points >= c else { continue }
             if best == nil || c < best!.cost { best = ("g\(g.id)", c) }
         }
         return best?.id
     }
 
     private func buy(_ action: () -> Int) {
-        _ = action()
+        if action() > 0 { Haptics.purchase() }
     }
 
     private func genSubtitle(_ gen: Generator) -> String {
@@ -200,9 +216,32 @@ struct ShopView: View {
                     .background(Capsule().fill(on ? Theme.brass : Theme.bgTop.opacity(0.6)))
                     .contentShape(Capsule())
                     .onTapGesture { qty = q }
+                    .accessibilityLabel("Buy \(q.label)")
+                    .accessibilityAddTraits(on ? [.isButton, .isSelected] : .isButton)
+                    .accessibilityAction { qty = q }
             }
         }
         .padding(.vertical, 2)
+        .accessibilityLabel("Purchase quantity")
+    }
+
+    private var hapticsRow: some View {
+        Toggle(isOn: $hapticsOn) {
+            Label("Haptics", systemImage: "hand.tap.fill")
+                .font(.system(size: 13, weight: .bold, design: .rounded))
+                .foregroundStyle(Theme.ink)
+        }
+        .tint(Theme.brass)
+        .onChange(of: hapticsOn) { _, on in
+            Haptics.enabled = on
+            if on { Haptics.purchase() }   // let them feel what they just turned on
+        }
+        .listRowBackground(
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .fill(Theme.bgTop.opacity(0.55))
+                .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .stroke(Theme.brass.opacity(0.35), lineWidth: 1))
+        )
     }
 
     private func sectionHeader(_ text: String, systemImage: String) -> some View {

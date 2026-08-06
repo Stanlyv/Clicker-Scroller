@@ -18,9 +18,9 @@ struct Clicker_Scroller_Watch_AppApp: App {
                 .environmentObject(game)
         }
         .onChange(of: scenePhase) { _, phase in
-            // Persist whenever we leave the foreground so progress survives
-            // being backgrounded.
-            if phase != .active { game.save() }
+            // Leaving the foreground parks the idle loop (and saves on the way
+            // out) so a watch on the wrist isn't ticking a timer it can't show.
+            game.setActive(phase == .active)
         }
     }
 }

@@ -92,6 +92,7 @@ final class GameState: ObservableObject {
 
     private var idleTimer: AnyCancellable?
     private var saveAccumulator: TimeInterval = 0
+    private var lastTickAt: Date = .now
     private let saveKey = "gearclicker.save.v1"
 
     init() {
@@ -263,9 +264,34 @@ final class GameState: ObservableObject {
 
     private func startIdleLoop() {
         // 10 Hz keeps the per-second counter buttery without burning battery.
+        lastTickAt = Date()
         idleTimer = Timer.publish(every: 0.1, on: .main, in: .common)
             .autoconnect()
-            .sink { [weak self] _ in self?.advance(by: 0.1) }
+            .sink { [weak self] _ in self?.tick() }
+    }
+
+    /// Advance by the time that *actually* elapsed rather than the nominal 0.1s.
+    /// watchOS coalesces timers freely, so trusting the interval would quietly
+    /// short-change the player; the clamp keeps a long stall from paying out as
+    /// offline earnings, which this game deliberately doesn't have.
+    private func tick() {
+        let now = Date()
+        let dt = min(max(now.timeIntervalSince(lastTickAt), 0), 0.5)
+        lastTickAt = now
+        advance(by: dt)
+    }
+
+    /// Suspend the whole economy while the app is off-screen: no timer wakeups,
+    /// no accrual. Called from the scene-phase observer.
+    func setActive(_ active: Bool) {
+        if active {
+            guard idleTimer == nil else { return }
+            startIdleLoop()
+        } else if idleTimer != nil {
+            idleTimer?.cancel()
+            idleTimer = nil
+            save()
+        }
     }
 
     private func advance(by dt: TimeInterval) {

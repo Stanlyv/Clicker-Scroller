@@ -72,6 +72,10 @@ struct ShopRow: View {
         }
         .buttonStyle(.plain)
         .disabled(!affordable)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(owned > 0 ? "\(title), \(owned) owned" : title)
+        .accessibilityValue("\(subtitle). Costs \(costText)\(countLabel.map { " for \($0)" } ?? "")")
+        .accessibilityHint(affordable ? "Buys this upgrade" : "You cannot afford this yet")
         .listRowBackground(
             RoundedRectangle(cornerRadius: 12, style: .continuous)
                 .fill(Theme.bgTop.opacity(affordable ? 0.55 : 0.30))
